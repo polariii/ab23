@@ -1,0 +1,264 @@
+---
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "Sample of leveraging Lambda@Edge to block 400/401 response with WAF"
+
+Parameters:
+  CountBlock:
+    Type: String
+    Default: '10'
+    Description: Maximum number of 400/401 responses perchecking block per ip
+
+  TimeCheckBlock:
+    Type: String
+    Default : '60'
+    Description: Amount of time (in seconds) checking block
+
+  TimeHistoryinLogDDB:
+    Type: String
+    Default : '300'
+    Description: Amount of time (in seconds) for ips deleting from log dynamodb
+
+  TimeIpBlockedinWAF:
+    Type: String
+    Default : '1200'
+    Description: Amount of time (in seconds) for ips deleting from blocked dynamodb and WAF
+
+
+Resources:
+  #
+  # ---------- Monitor Limit Function (origin-response) ----------
+  #
+  CfanalyserequestsWaf:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Cf_analyserequests_Waf_PROD
+      Description: Cf_analyserequests_Waf_PROD
+      Code: Cf_analyserequests_Waf_PROD.js
+      Handler: Cf_analyserequests_Waf_PROD.handler
+      Runtime: nodejs14.x
+      Role: !GetAtt EdgeBlockingFunctionRole.Arn
+      Timeout: 3
+
+  #
+  # ---------- WAF ----------
+  WAFIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties: 
+      IPAddressVersion: IPV4
+      Name: 'ato-bot'
+      Scope: CLOUDFRONT
+      Addresses: ["1.2.3.4/32"]
+
+
+  WAFACL:
+    Type: 'AWS::WAFv2::WebACL'
+    Properties:
+      Name: ato-bot-acl
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: ato-bot-acl-Metric
+      Rules:
+        - Name: ato-bot-rule
+          Priority: 0
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: ato-bot-rule-Metric
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt WAFIpSet.Arn
+
+  #
+  # ---------- Insert DDB & WAF Function ----------
+  #
+  InsertWafanalyserequestsPROD:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Insert_Waf_analyserequests_PROD
+      Description: Insert_Waf_analyserequests_PROD
+      Code: Insert_Waf_analyserequests_PROD.py
+      Handler: Insert_Waf_analyserequests_PROD.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt EdgeBlockingFunctionRole.Arn
+      Timeout: 3
+      Environment:
+        Variables:
+          COUNT_BLOCK: !Ref CountBlock
+          DYNAMODB_REGION: !Sub "${AWS::Region}"
+          DYNAMODB_TABLE: 'Cf_analyserequests_Waf_PROD'
+          DYNAMODB_TABLE_BLOCKED_IPS : 'Cf_blocked_ips_Waf_PROD'
+          IP_SET_ID_AUTO_BLOCK: 
+            Fn::GetAtt:
+              [WAFIpSet, Id]
+          WAF_IP_SET_NAME: 'ato-bot'
+          TIME_CHECK_BLOCK: !Ref TimeCheckBlock
+  
+  #
+  # ---------- Purge DDB & WAF Function ----------
+  #
+  PurgeIPsWafDynamodbPROD:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Purge_IPs_Waf_Dynamodb_PROD
+      Description: Purge_IPs_Waf_Dynamodb_PROD
+      Code: Purge_IPs_Waf_Dynamodb_PROD.py
+      Handler: Purge_IPs_Waf_Dynamodb_PROD.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt EdgeBlockingFunctionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          DYNAMODB_REGION: !Sub "${AWS::Region}"
+          DYNAMODB_TABLE: Cf_analyserequests_Waf_PROD
+          DYNAMODB_TABLE_BLOCKED_IPS : Cf_blocked_ips_Waf_PROD
+          IP_SET_ID_AUTO_BLOCK: 
+            Fn::GetAtt: 
+              [WAFIpSet, Id]
+          WAF_IP_SET_NAME: 'ato-bot'
+          TIME_HISTORY_DYNAMODB: !Ref TimeHistoryinLogDDB
+          TIME_IP_BLOCKED_WAF: !Ref TimeIpBlockedinWAF
+
+  #
+  # ---------- DynamoDB Table ----------
+
+  LogDDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'Cf_analyserequests_Waf_PROD'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        -
+          AttributeName: CLIENTIP
+          AttributeType: 'S'
+        -
+          AttributeName: TIMESTAMP
+          AttributeType: 'N'      
+        -
+          AttributeName: ID
+          AttributeType: 'S' 
+      KeySchema:
+        -
+          AttributeName: ID
+          KeyType: HASH    
+      GlobalSecondaryIndexes:
+        -
+          IndexName: "CLIENTIP"
+          KeySchema:
+            -
+              AttributeName: "CLIENTIP"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+        -
+          IndexName: "TIMESTAMP"
+          KeySchema:
+            -
+              AttributeName: "TIMESTAMP"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+        -
+          IndexName: "CLIENTIPAndTIMESTAMP"
+          KeySchema:
+            -
+              AttributeName: "CLIENTIP"
+              KeyType: "HASH"
+          Projection:
+            NonKeyAttributes:
+              - "CLIENTIP"
+              - "ID"
+              - "TIMESTAMP"
+            ProjectionType: "INCLUDE"
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  BlockingDDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'Cf_blocked_ips_Waf_PROD'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        -
+          AttributeName: IP
+          AttributeType: 'S'    
+        -
+          AttributeName: TIMESTAMP
+          AttributeType: 'N'      
+      KeySchema:
+        -
+          AttributeName: IP
+          KeyType: HASH    
+      GlobalSecondaryIndexes:
+        -
+          IndexName: "TIMESTAMP"
+          KeySchema:
+            -
+              AttributeName: "TIMESTAMP"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+
+  DDBLambdaTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: 'True'
+      EventSourceArn:
+        !GetAtt LogDDBTable.StreamArn
+      FunctionName:
+        !GetAtt InsertWafanalyserequestsPROD.Arn
+      StartingPosition: LATEST
+  
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt PurgeIPsWafDynamodbPROD.Arn
+          Id: "PurgeIPsWafDynamodbPROD"
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt PurgeIPsWafDynamodbPROD.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+
+  # ---------- IAM ----------
+  #
+  EdgeBlockingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/EdgeBlocking/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/CloudFrontFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AWSWAFFullAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: AllowLambdaServiceToAssumeRole
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+
